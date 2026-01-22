@@ -1,6 +1,8 @@
 import uuid
 from datetime import datetime
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -10,6 +12,10 @@ class Segment(BaseModel):
     id: str = Field(default_factory=lambda: f"seg_{uuid.uuid4().hex[:8]}")
     description: str = Field(default="")
     manim_code: str
+    code_type: Literal["construct", "preamble"] = Field(
+        default="construct",
+        description="'construct' = code inside construct() method, 'preamble' = code outside class (imports, helper classes, functions)",
+    )
 
 
 class Project(BaseModel):

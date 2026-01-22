@@ -1,56 +1,106 @@
 import uuid
-
-from datetime import datetime
+import subprocess
 
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
-from config import settings
+from .config import settings
+from .models import Segment, Project
 
 mcp = FastMCP("manim-server")
 
 projects: dict[str, "Project"] = {}
 
-class ManimObject(BaseModel):
-    """A single Manim object"""
+def generate_scene_code(project: Project, segment_id: str | None = None) -> str:
+    """Assemble complete Manim scene from project segments.
 
-    id: str = Field(..., description="The unique identifier of the object")
-    type: str = Field(..., description="Object type: text, matrix, equation, circle, etc")
-    properties: dict = Field(default_factory=dict, description="Object properties")
-    position: list[float] | None  = Field(default=None, description="Object position in 3D space")
-    color: str | None = Field(default=None, description="Object color")
+    Handles two types of segments:
+    - 'preamble': Code placed outside the class (imports, helper classes, functions)
+    - 'construct': Code placed inside the construct() method
+    """
+    if segment_id:
+        segments = [s for s in project.segments if s.id == segment_id]
+    else:
+        segments = project.segments
 
+    # Separate segments by type
+    preamble_segments = [s.manim_code for s in segments if s.code_type == "preamble"]
+    construct_segments = [s.manim_code for s in segments if s.code_type == "construct"]
 
+    def indent_code(code: str, spaces: int = 8) -> str:
+        indent = " " * spaces
+        lines = code.split("\n")
+        return "\n".join(indent + line if line.strip() else line for line in lines)
 
-class Animation(BaseModel):
-    """ A single Manim animation"""
+    preamble_code = "\n\n".join(preamble_segments)
+    construct_code = "\n\n".join(indent_code(c) for c in construct_segments)
 
-    type: str = Field(..., description="Animation type: write, fade_in, move, rotate, scale, etc")
+    # Build the final code
+    parts = ["from manim import *"]
 
-    target: str | list[str] = Field(..., description="Object ID to animate")
+    if preamble_code:
+        parts.append(preamble_code)
 
-    properties: dict = Field(default_factory=dict, description="Animation properties")
+    parts.append(f'''class GeneratedScene(Scene):
+    def construct(self):
+{construct_code}''')
 
+    return "\n\n".join(parts) + "\n"
 
+def run_manim(scene_file: Path, output_name: str, quality: str = "medium_quality", preview_mode: bool = False) -> tuple[bool, str, str | None]:
+    """Run Manim to render a scene.
 
-class Segment(BaseModel):
-    """ A single segment containing objects and animations"""
+    Returns:
+        Tuple of (success, message, output_path or None)
+    """
+    # Map quality strings to manim CLI flags and folder names
+    quality_map = {
+        "low_quality": ("l", "480p15"),
+        "medium_quality": ("m", "720p30"),
+        "high_quality": ("h", "1080p60"),
+        "fourk_quality": ("k", "2160p60"),
+    }
+    quality_flag, quality_folder = quality_map.get(quality, ("m", "720p30"))
 
-    id: str = Field(default_factory=lambda: f"seg_{uuid.uuid4().hex[:8]}")
-    objects: list[ManimObject] = Field(default_factory=list, description="Objects in the segment")
+    cmd = [
+        "manim", "render",
+        str(scene_file), "GeneratedScene",
+        "-q", quality_flag,
+        "-o", output_name,
+        "--media_dir", str(settings.output_dir),
+    ]
 
-    animations: list[Animation] = Field(default_factory=list, description="Animations in the segment")
+    if preview_mode:
+        cmd.append("-s")
 
-class Project(BaseModel):
-    """ A video project containing multiple segments"""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=settings.timeout)
 
-    id: str = Field(default_factory=lambda: f"proj_{uuid.uuid4().hex[:8]}")
-    name: str 
-    quality:str = Field(default="medium_quality", description="Quality of the video: low_quality, medium_quality, high_quality")
-    background_color: str | None = Field(default=None, description="Background color of the video")
-    segments: list[Segment] = Field(default_factory=list, description="Segments in the project")
-    created_at: datetime = Field(default_factory=datetime.now, description="Creation date and time")
+        if result.returncode != 0:
+            return False, f"Manim error: {result.stderr}", None
+
+        # Find the actual output file
+        # Manim organizes output by class name, not file name
+        scene_name = "GeneratedScene"
+        if preview_mode:
+            # Images go to: media_dir/images/scene_name/output_name.png
+            output_path = settings.output_dir / "images" / scene_name / f"{output_name}.png"
+        else:
+            # Videos go to: media_dir/videos/scene_name/quality_folder/output_name.mp4
+            output_path = settings.output_dir / "videos" / scene_name / quality_folder / f"{output_name}.mp4"
+
+        if output_path.exists():
+            return True, "Render successful", str(output_path)
+        else:
+            return False, f"Render completed but output not found at {output_path}", None
+
+    except subprocess.TimeoutExpired:
+        return False, f"Render timed out after {settings.timeout} seconds", None
+
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}", None
+
 
 
 
@@ -78,46 +128,150 @@ def create_project(name: str, quality: str = "medium_quality", background_color:
 
 
 @mcp.tool()
-def add_segment(project_id: str, objects: list[dict], animations: list[dict]) -> dict:
-    """ Add a segment with objects and animations to a project
+def add_segment(project_id: str, manim_code: str, description: str = "", code_type: str = "construct") -> dict:
+    """Add a segment with manim code to the project.
 
     Args:
-        project_id: The ID of the project
-        objects: List of object to create. Each object needs:
-        - id: The unique identifier of the object
-        - type: The type of the object
-        - properties: The properties of the object
-        - position: The position of the object in 3D space
-        - color: The color of the object
-
-        animations: List of animations to apply to the objects. Each animation needs:
-        - type: The type of the animation
-        - target: The ID of the object to animate
-        - properties: The properties of the animation
+        project_id: The project ID from create_project
+        manim_code: Raw Manim code
+        description: Optional description of what this segment does
+        code_type: 'construct' (default) = code inside construct() method,
+                   'preamble' = code outside class (imports, helper classes, functions)
 
     Returns:
         Segment info with segment_id
     """
-
     if project_id not in projects:
         return {"error": f"Project with ID {project_id} not found"}
 
+    if code_type not in ("construct", "preamble"):
+        return {"error": f"Invalid code_type '{code_type}'. Must be 'construct' or 'preamble'"}
+
     project = projects[project_id]
 
-    manim_objects = [ManimObject(**obj) for obj in objects]
-
-    manim_animations = [Animation(**anim) for anim in animations]
-
-
-    segment = Segment(objects= manim_objects, animations=manim_animations,)
+    segment = Segment(manim_code=manim_code, description=description, code_type=code_type)
 
     project.segments.append(segment)
 
-    return{
+    return {
         "segment_id": segment.id,
         "project_id": project_id,
-        "objects_count": len(manim_objects),
-        "animations_count": len(manim_animations),
+        "code_type": code_type,
         "total_segments": len(project.segments),
-        "message": f"Sgement added with {len(manim_objects)} objects and {len(manim_animations)} animations",
+        "message": "Segment added successfully",
     }
+
+
+@mcp.tool()
+def preview(project_id: str, segment_id: str | None = None,) -> dict:
+    """Generate a preview image of the project or a specific segment
+
+
+    Args:
+        project_id: The project ID
+        segement_id: Optional - preview only this segment
+
+    Returns:
+        Path to the preview image
+    """
+
+    if project_id not in projects:
+        return {"error": f"Project '{project_id}' not found"}
+
+    project = projects[project_id]
+
+    if not project.segments:
+        return {"error": "Project has no segments. Use add_segment first"}
+
+    scene_code = generate_scene_code(project,segment_id)
+
+    scene_file = settings.code_dir / f"{project.id}_preview.py"
+    scene_file.write_text(scene_code)
+
+    success, message, preview_path = run_manim(
+        scene_file=scene_file,
+        output_name=f"{project.id}_preview",
+        quality=project.quality,
+        preview_mode=True,
+    )
+
+    if not success:
+        return {"error": message}
+
+    return {
+        "preview_path": preview_path,
+        "project_id": project_id,
+        "message": "Preview generated successfully",
+    }
+
+@mcp.tool()
+def edit_segment(project_id:str, segment_id:str,manim_code:str,description:str | None = None,)->dict:
+    """Edit an existing segment's Manin code.
+
+    Args:
+        project_id: The project ID
+        segment_id: The segmen ID to edit
+        manim_code: New Manim code
+        description: Optional new description
+
+
+    Returns:
+        Updated segment info
+    """
+
+    if project_id not in projects:
+        return {"error": f"Project '{project_id}' not found"}
+
+    project = projects[project_id]
+    
+    segment = next((s for s in project.segments if s.id == segment_id), None)
+
+    if not segment:
+        return {"error": f"Segment '{segment_id}' not found"}
+
+
+    segment.manim_code=manim_code
+
+    if description is not None:
+        segment.description=description
+
+    return {"segment_id": segment.id,"message": "Segment updated successfully"}
+
+
+@mcp.tool()
+def render(project_id: str)->dict:
+    """Render the final video.
+
+    Args:
+        project_id: The project ID
+
+    Returns:
+        Path to rendered video"""
+
+    if project_id not in projects:
+        return{"error": f"Project '{project_id}' not found"}
+
+    project = projects[project_id]
+
+    if not project.segments:
+        return{"error": "Project has no segments. Use add_segment first."}
+
+    scene_code = generate_scene_code(project)
+    scene_file = settings.code_dir / f"{project.id}_final.py"
+    scene_file.write_text(scene_code)
+
+    success, message, video_path = run_manim(
+        scene_file=scene_file,
+        output_name=project.id,
+        quality=project.quality,
+        preview_mode=False,
+    )
+
+    if not success:
+        return {"error": message}
+
+    return {"video_path": video_path, "message": f"Video rendered: {video_path}"}
+
+
+if __name__=="__main__":
+    mcp.run()
